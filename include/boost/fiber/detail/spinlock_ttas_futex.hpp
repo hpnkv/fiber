@@ -33,14 +33,18 @@ private:
     std::atomic< std::int32_t >                 value_{ 0 };
 
 public:
+    static constexpr int32_t kUnlocked = 0;
+    static constexpr int32_t kLocked = 1;
+    static constexpr int32_t kLockedWithWaiters = 2;
+
     spinlock_ttas_futex() = default;
 
     spinlock_ttas_futex( spinlock_ttas_futex const&) = delete;
     spinlock_ttas_futex & operator=( spinlock_ttas_futex const&) = delete;
 
     void lock() noexcept {
-        static thread_local std::minstd_rand generator{ std::random_device{}() };
-        std::int32_t collisions = 0, retries = 0, expected = 0;
+        thread_local std::minstd_rand generator{ std::random_device{}() };
+        std::int32_t collisions = 0, retries = 0, expected = kUnlocked;
         // after max. spins or collisions suspend via futex
         while ( retries++ < BOOST_FIBERS_RETRY_THRESHOLD) {
             // avoid using multiple pause instructions for a delay of a specific cycle count
@@ -53,7 +57,7 @@ public:
             // sucessive acccess to 'value_' -> cache hit
             // if 'value_' was released by other fiber
             // cached 'value_' is invalidated -> cache miss
-            if ( 0 != ( expected = value_.load( std::memory_order_relaxed) ) ) {
+            if ( kUnlocked != ( expected = value_.load( std::memory_order_relaxed) ) ) {
 #if !defined(BOOST_FIBERS_SPIN_SINGLE_CORE)
                 if ( BOOST_FIBERS_SPIN_BEFORE_SLEEP0 > retries) {
                     // give CPU a hint that this thread is in a "spin-wait" loop
@@ -81,7 +85,7 @@ public:
                 // instead of constant checking, a thread only checks if no other useful work is pending
                 std::this_thread::yield();
 #endif
-            } else if ( ! value_.compare_exchange_strong( expected, 1, std::memory_order_acquire) ) {
+            } else if ( ! value_.compare_exchange_strong( expected, kLocked, std::memory_order_acquire) ) {
                 // spinlock now contended
                 // utilize 'Binary Exponential Backoff' algorithm
                 // linear_congruential_engine is a random number engine based on Linear congruential generator (LCG)
@@ -99,26 +103,33 @@ public:
                 return;
             }
         }
-        // failure, lock not acquired
-        // pause via futex
-        if ( 2 != expected) {
-            expected = value_.exchange( 2, std::memory_order_acquire);
+        if (try_lock()) {
+            return;
         }
-        while ( 0 != expected) {
-            futex_wait( & value_, 2);
-            expected = value_.exchange( 2, std::memory_order_acquire);
+        while (true) {
+            expected = kUnlocked;
+            if (value_.compare_exchange_weak(expected, kLockedWithWaiters, std::memory_order_acquire)) {
+                return;
+            }
+
+            futex_wait(&value_, kLockedWithWaiters);
         }
     }
 
     bool try_lock() noexcept {
-        std::int32_t expected = 0;
-        return value_.compare_exchange_strong( expected, 1, std::memory_order_acquire);
+        std::int32_t expected = kUnlocked;
+        return value_.compare_exchange_strong( expected, kLocked, std::memory_order_acquire);
     }
 
     void unlock() noexcept {
-        if ( 1 != value_.fetch_sub( 1, std::memory_order_acquire) ) {
-            value_.store( 0, std::memory_order_release);
-            futex_wake( & value_);
+        if (const std::int32_t state = value_.load(std::memory_order_relaxed);
+        state == kLockedWithWaiters) {
+            value_.store(kUnlocked, std::memory_order_release);
+            futex_wake(&value_);
+        } else if (state == value_) {
+            value_.store(kUnlocked, std::memory_order_release);
+        } else {
+            std::terminate();
         }
     }
 };

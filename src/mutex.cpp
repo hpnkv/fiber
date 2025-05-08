@@ -23,40 +23,39 @@ namespace fibers {
 
 void
 mutex::lock() {
+    context * calling_context = context::active();
     while ( true) {
-        context * active_ctx = context::active();
         // store this fiber in order to be notified later
         detail::spinlock_lock lk{ wait_queue_splk_ };
-        if ( BOOST_UNLIKELY( active_ctx == owner_) ) {
+        if ( BOOST_UNLIKELY( owner_ == calling_context) ) {
             throw lock_error{
                     std::make_error_code( std::errc::resource_deadlock_would_occur),
                     "boost fiber: a deadlock is detected" };
         }
-        if ( nullptr == owner_) {
-            owner_ = active_ctx;
+        if ( owner_ == nullptr) {
+            owner_ = calling_context;
             return;
         }
 
-        wait_queue_.suspend_and_wait( lk, active_ctx);
+        wait_queue_.suspend_and_wait( lk, calling_context);
     }
 }
 
 bool
 mutex::try_lock() {
-    context * active_ctx = context::active();
-    detail::spinlock_lock lk{ wait_queue_splk_ };
-    if ( BOOST_UNLIKELY( active_ctx == owner_) ) {
-        throw lock_error{
-                std::make_error_code( std::errc::resource_deadlock_would_occur),
-                "boost fiber: a deadlock is detected" };
-    }
-    if ( nullptr == owner_) {
-        owner_ = active_ctx;
-    }
-    lk.unlock();
-    // let other fiber release the lock
-    active_ctx->yield();
-    return active_ctx == owner_;
+  context * active_ctx = context::active();
+  if (!wait_queue_splk_.try_lock()) {
+    return false;
+  }
+  if ( BOOST_UNLIKELY( owner_ == active_ctx) ) {
+    throw lock_error{
+      std::make_error_code( std::errc::resource_deadlock_would_occur),
+      "boost fiber: a deadlock is detected" };
+  }
+  if ( nullptr == owner_) {
+    owner_ = active_ctx;
+  }
+  return owner_ == active_ctx;
 }
 
 void
